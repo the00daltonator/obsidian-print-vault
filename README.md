@@ -9,7 +9,7 @@ Click the printer icon in the left ribbon. Every note in your vault is exported 
 - Page numbers in the footer; PDF bookmarks for every chapter and note
 
 ## Install
-Copy `manifest.json` and `main.js` into
+Copy `manifest.json`, `main.js`, and `pdf-lib.min.js` into
 `<your vault>/.obsidian/plugins/print-vault-pdf/`, then go to Settings → Community plugins, click the reload icon, and turn on **Print Vault to PDF**.
 
 ## Use
@@ -19,4 +19,4 @@ Copy `manifest.json` and `main.js` into
 
 Settings let you choose the grouping (folder/tag, with an optional ordered list of tag chapters), sort order, excluded folders and tags, page size, font size, whether each note starts on a new page, and whether images are included.
 
-Desktop only. Uses Chromium's built-in print engine: it prints once, reads where each note landed from the PDF bookmarks, fills in the page numbers, and prints again. A 1000+ note vault takes a few minutes, mostly for rendering notes and resizing images.
+Desktop only. Uses Chromium's built-in print engine in chunks of ~100 notes (Chromium can't print thousands of pages at once), reads where each note landed from each chunk's bookmarks, fills in the page numbers, prints again, and merges the chunks with [pdf-lib](https://github.com/Hopding/pdf-lib) (MIT), which also stamps page numbers and adds bookmarks. A 1000+ note vault takes a few minutes, mostly for rendering notes and resizing images.

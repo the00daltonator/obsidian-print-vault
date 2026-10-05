@@ -385,6 +385,8 @@ module.exports = class PrintVaultPlugin extends Plugin {
     const date = new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
     const total = ctx.idByPath.size;
 
+    const items = [];   // children of <main>, in order: used to print in chunks
+    const outline = []; // chapters → notes, for PDF bookmarks
     const fh = await require("fs").promises.open(htmlPath, "w");
     const write = (str) => fh.write(str + "\n");
     try {
@@ -397,6 +399,14 @@ window.__fill = function (pages) {
     var p = pages[el.dataset.t], toc = el.classList.contains("toc-pg");
     el.textContent = p ? (toc ? String(p) : "(p. " + p + ")") : (toc ? "" : "(§" + el.dataset.n + ")");
   });
+  return true;
+};
+// Show only one slice of the document (chunk -1 = cover + contents) so each print stays small.
+window.__show = function (from, to) {
+  var front = from < 0;
+  document.querySelectorAll("body > section").forEach(function (el) { el.style.display = front ? "" : "none"; });
+  var kids = document.querySelector("main").children;
+  for (var i = 0; i < kids.length; i++) kids[i].style.display = !front && i >= from && i < to ? "" : "none";
   return true;
 };
 <\/script>
@@ -412,7 +422,11 @@ window.__fill = function (pages) {
     // Body
     let done = 0;
     for (const [gi, g] of groups.entries()) {
-      if (grouped) await write(`<h1 class="chapter-title" id="${g.id}"><span class="chapter-num">${gi + 1}</span>${esc(g.name)}</h1><p class="chapter-count">${g.files.length} note${g.files.length === 1 ? "" : "s"}</p>`);
+      if (grouped) {
+        await write(`<div class="chapter-head"><h1 class="chapter-title" id="${g.id}"><span class="chapter-num">${gi + 1}</span>${esc(g.name)}</h1><p class="chapter-count">${g.files.length} note${g.files.length === 1 ? "" : "s"}</p></div>`);
+        items.push({ chapter: true, id: g.id, notes: g.files.length, bytes: 0 });
+        outline.push({ id: g.id, title: `${gi + 1}  ${g.name}`, children: [] });
+      }
       for (const f of g.files) {
         const id = ctx.idByPath.get(f.path);
         const html = await this.renderNote(f, ctx);
@@ -425,14 +439,18 @@ window.__fill = function (pages) {
         const links = s.showLinks
           ? `<div class="links">${this.linkList("Links to", out.get(f.path) || [], ctx)}${this.linkList("Linked from", inc.get(f.path) || [], ctx)}</div>`
           : "";
-        await write(
+        const article =
           `<article class="note${s.noteOnNewPage ? " new-page" : ""}" id="${id}">` +
             `<h2 class="note-title"><span class="note-num">${esc(ctx.numByPath.get(f.path))}</span>${esc(f.basename)}</h2>` +
             `<div class="note-meta">${meta.join("")}</div>` +
             links +
             `<div class="note-body">${html}</div>` +
-          `</article>`
-        );
+          `</article>`;
+        await write(article);
+        items.push({ chapter: false, id, bytes: article.length });
+        const entry = { id, title: `${ctx.numByPath.get(f.path)}  ${f.basename}` };
+        if (grouped) outline[outline.length - 1].children.push(entry);
+        else outline.push(entry);
         done++;
         if (done % 10 === 0 || done === total) progress(`Rendering notes… ${done}/${total}`);
         await sleep(done % 20 === 0 ? 16 : 0); // let Obsidian repaint between notes
@@ -442,7 +460,7 @@ window.__fill = function (pages) {
     } finally {
       await fh.close();
     }
-    return keyById;
+    return { keyById, items, outline };
   }
 
   // ---------- PDF ----------
@@ -477,10 +495,10 @@ window.__fill = function (pages) {
       tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "print-vault-"));
       const tmpHtml = path.join(tmpDir, "export.html");
       this.log(`${files.length} notes in ${groups.length} groups; temp folder ${tmpDir}`);
-      const keyById = await this.writeHtml(groups, title, progress, tmpHtml, tmpDir);
+      const layout = await this.writeHtml(groups, title, progress, tmpHtml, tmpDir);
       this.log(`HTML written: ${(fs.statSync(tmpHtml).size / 1048576).toFixed(1)} MB, ${fs.readdirSync(tmpDir).length - 1} images`);
 
-      const pdf = await this.printHtmlToPdf(tmpHtml, keyById, progress);
+      const pdf = await this.printHtmlToPdf(tmpHtml, layout, tmpDir, progress);
 
       const stamp = new Date().toISOString().slice(0, 10);
       const folder = normalizePath(this.settings.outputFolder || "/");
@@ -514,24 +532,32 @@ window.__fill = function (pages) {
   }
 
   /**
-   * Prints with Chromium's native engine (fast, even for thousands of pages).
-   * Pass 1 prints, reads which page every heading landed on from the PDF's
-   * bookmarks, writes those numbers into the TOC and link references, then
-   * prints again. Page-number slots are fixed width, so layout doesn't shift.
+   * Prints with Chromium's native engine. Chromium can't print thousands of
+   * pages in one go ("Printing failed"), so the document is printed in chunks
+   * of ~100 notes by hiding everything else, then merged with pdf-lib.
+   * Pass 1 learns where every heading lands (from each chunk's PDF bookmarks);
+   * the page numbers are written into fixed-width slots, and pass 2 prints
+   * the final chunks. Page numbers and bookmarks are added after merging.
    */
-  async printHtmlToPdf(htmlPath, keyById, progress) {
+  async printHtmlToPdf(htmlPath, layout, tmpDir, progress) {
+    const fs = require("fs"), path = require("path");
     const electron = require("electron");
     const remote = electron.remote || (() => { try { return require("@electron/remote"); } catch (_) { return null; } })();
-    const s = this.settings;
-    const pdfOpts = {
-      printBackground: true,
-      preferCSSPageSize: true,
-      generateDocumentOutline: true,
-      displayHeaderFooter: true,
-      headerTemplate: "<span></span>",
-      footerTemplate: '<div style="width:100%;text-align:center;font:8px Georgia,serif;color:#555;"><span class="pageNumber"></span></div>',
-      pageSize: s.pageSize === "A4" ? "A4" : "Letter",
-    };
+    const { keyById, items, outline } = layout;
+    const pdfOpts = { printBackground: true, preferCSSPageSize: true, generateDocumentOutline: true };
+
+    // Chunk plan over <main>'s children. Chunk -1 is the cover + contents.
+    const MAX_NOTES = 100, MAX_BYTES = 12 * 1024 * 1024;
+    const chunks = [[-1, -1]];
+    let start = 0, notes = 0, bytes = 0;
+    items.forEach((it, i) => {
+      const full = notes >= MAX_NOTES || bytes >= MAX_BYTES || (it.chapter && notes >= 30 && notes + it.notes > MAX_NOTES);
+      if (i > start && full) { chunks.push([start, i]); start = i; notes = 0; bytes = 0; }
+      if (!it.chapter) notes++;
+      bytes += it.bytes;
+    });
+    if (start < items.length) chunks.push([start, items.length]);
+    this.log(`Printing in ${chunks.length} chunks`);
 
     let page;
     this.log(`Printing with ${remote && remote.BrowserWindow ? "hidden window" : "webview"}`);
@@ -559,32 +585,127 @@ window.__fill = function (pages) {
       };
     }
 
+    const printChunk = async (k) => {
+      const [from, to] = chunks[k];
+      await page.exec(`window.__show(${from}, ${to})`);
+      await sleep(50);
+      const t0 = Date.now();
+      const data = Buffer.from(await page.print());
+      const info = pdfHeadingPages(data);
+      this.log(`  chunk ${k + 1}/${chunks.length}: ${info ? info.pageCount : "?"} pages, ${(data.length / 1048576).toFixed(1)} MB, ${((Date.now() - t0) / 1000).toFixed(0)} s`);
+      return { data, info };
+    };
+
+    let files = [];
+    let pages = {};
     try {
       progress("Loading pages for printing…");
       await page.load();
       await page.exec("document.fonts ? document.fonts.ready.then(() => true) : true");
-      await page.exec(`Promise.all([...document.images].map(i => i.complete ? 0 : new Promise(r => { i.onload = i.onerror = r; })))`);
+      await page.exec(`Promise.all([...document.images].map(i => i.complete ? 0 : new Promise(r => { i.onload = i.onerror = r; }))).then(() => true)`);
 
-      let pdf = null, prev = "";
-      for (let pass = 1; pass <= 3; pass++) {
-        progress(pass === 1 ? "Laying out pages…" : `Adding page numbers (pass ${pass})…`);
-        const t0 = Date.now();
-        pdf = Buffer.from(await page.print());
-        const byTitle = pdfHeadingPages(pdf);
-        this.log(`Pass ${pass}: ${(pdf.length / 1048576).toFixed(1)} MB in ${((Date.now() - t0) / 1000).toFixed(0)} s, ${byTitle ? byTitle.size : 0} bookmarks`);
-        if (!byTitle) { console.warn("print-vault-pdf: no bookmarks found; using note numbers instead of page numbers"); break; }
-        const pages = {};
-        for (const [id, key] of Object.entries(keyById)) if (byTitle.has(key)) pages[id] = byTitle.get(key);
-        const sig = JSON.stringify(pages);
-        if (sig === prev) break; // numbers already printed are correct
-        prev = sig;
-        await page.exec(`window.__fill(${sig})`);
-        if (pass === 3) pdf = Buffer.from(await page.print());
+      // Pass 1: where does every heading land?
+      const counts = [];
+      let offset = 0, located = true;
+      for (let k = 0; k < chunks.length; k++) {
+        progress(`Laying out pages… part ${k + 1}/${chunks.length}`);
+        const { info } = await printChunk(k);
+        if (!info) { located = false; counts.push(0); continue; }
+        counts.push(info.pageCount);
+        for (const [id, key] of Object.entries(keyById)) {
+          if (pages[id] == null && info.headings.has(key)) pages[id] = offset + info.headings.get(key);
+        }
+        offset += info.pageCount;
       }
-      return pdf;
+      this.log(`Pass 1: ${offset} pages; located ${Object.keys(pages).length}/${Object.keys(keyById).length} headings${located ? "" : " (some chunks unreadable)"}`);
+      await page.exec(`window.__fill(${JSON.stringify(pages)})`);
+
+      // Pass 2: final print with page numbers filled in.
+      for (let k = 0; k < chunks.length; k++) {
+        progress(`Printing with page numbers… part ${k + 1}/${chunks.length}`);
+        const { data, info } = await printChunk(k);
+        if (info && counts[k] && info.pageCount !== counts[k]) this.log(`  warning: chunk ${k + 1} changed from ${counts[k]} to ${info.pageCount} pages`);
+        const f = path.join(tmpDir, `chunk-${k}.pdf`);
+        await fs.promises.writeFile(f, data);
+        files.push(f);
+      }
     } finally {
       page.close();
     }
+
+    progress("Combining into one PDF…");
+    return await this.mergePdfs(files, outline, pages, progress);
+  }
+
+  async loadPdfLib() {
+    if (this.PDFLib) return this.PDFLib;
+    const code = await this.app.vault.adapter.read(normalizePath(this.manifest.dir + "/pdf-lib.min.js"));
+    const mod = { exports: {} };
+    new Function("exports", "module", code)(mod.exports, mod);
+    return (this.PDFLib = mod.exports);
+  }
+
+  /** Concatenates chunk PDFs, stamps page numbers (not on the cover), and adds chapter/note bookmarks. */
+  async mergePdfs(files, outline, pages, progress) {
+    const fs = require("fs");
+    const { PDFDocument, StandardFonts, rgb, PDFName, PDFHexString, PDFNumber } = await this.loadPdfLib();
+    const doc = await PDFDocument.create();
+    for (let k = 0; k < files.length; k++) {
+      progress(`Combining into one PDF… part ${k + 1}/${files.length}`);
+      const src = await PDFDocument.load(await fs.promises.readFile(files[k]), { updateMetadata: false });
+      const copied = await doc.copyPages(src, src.getPageIndices());
+      copied.forEach((pg) => doc.addPage(pg));
+      await sleep(0);
+    }
+
+    progress("Adding page numbers…");
+    const font = await doc.embedFont(StandardFonts.TimesRoman);
+    const all = doc.getPages();
+    all.forEach((pg, i) => {
+      if (i === 0) return; // cover
+      const label = String(i + 1);
+      const { width } = pg.getSize();
+      pg.drawText(label, { x: (width - font.widthOfTextAtSize(label, 9)) / 2, y: 30, size: 9, font, color: rgb(0.33, 0.33, 0.33) });
+    });
+
+    // Bookmarks: chapters → notes, pointing at the pages found in pass 1.
+    try {
+      const ctx = doc.context;
+      const refs = all.map((pg) => pg.ref);
+      const build = (list, parentRef) => {
+        const usable = list.filter((e) => pages[e.id] && refs[pages[e.id] - 1]);
+        const own = usable.map(() => ctx.nextRef());
+        usable.forEach((e, i) => {
+          const dict = ctx.obj({});
+          dict.set(PDFName.of("Title"), PDFHexString.fromText(e.title));
+          dict.set(PDFName.of("Parent"), parentRef);
+          dict.set(PDFName.of("Dest"), ctx.obj([refs[pages[e.id] - 1], PDFName.of("Fit")]));
+          if (i > 0) dict.set(PDFName.of("Prev"), own[i - 1]);
+          if (i < usable.length - 1) dict.set(PDFName.of("Next"), own[i + 1]);
+          if (e.children && e.children.length) {
+            const kids = build(e.children, own[i]);
+            if (kids) {
+              dict.set(PDFName.of("First"), kids.first);
+              dict.set(PDFName.of("Last"), kids.last);
+              dict.set(PDFName.of("Count"), PDFNumber.of(-kids.count)); // collapsed
+            }
+          }
+          ctx.assign(own[i], dict);
+        });
+        return own.length ? { first: own[0], last: own[own.length - 1], count: own.length } : null;
+      };
+      const rootRef = ctx.nextRef();
+      const top = build(outline, rootRef);
+      if (top) {
+        ctx.assign(rootRef, ctx.obj({ Type: "Outlines", First: top.first, Last: top.last, Count: PDFNumber.of(top.count) }));
+        doc.catalog.set(PDFName.of("Outlines"), rootRef);
+      }
+    } catch (e) {
+      this.log("Could not add bookmarks: " + e);
+    }
+
+    progress("Saving PDF…");
+    return Buffer.from(await doc.save({ useObjectStreams: false }));
   }
 };
 
@@ -594,6 +715,7 @@ window.__fill = function (pages) {
  * PDF can't be parsed; callers then fall back to note numbers.
  */
 function pdfHeadingPages(data) {
+  // → { pageCount, headings: Map(normalizedTitle → page) } or null
   const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
   const latin1 = (a, b) => {
     let s = "";
@@ -697,7 +819,7 @@ function pdfHeadingPages(data) {
         n = ref(o, "Next");
       }
     }
-    return result.size ? result : null;
+    return { pageCount: pageNum.size, headings: result };
   } catch (e) {
     console.warn("print-vault-pdf: could not read PDF outline", e);
     return null;
@@ -735,7 +857,8 @@ a { color: inherit; text-decoration: none; }
 .toc-chapter { font-weight: bold; font-size: 1.05rem; margin-top: .5em; border-bottom: 1px solid #ccc; }
 
 /* chapters & notes */
-.chapter-title { break-before: page; font-size: 1.9rem; margin: 0 0 1em; padding-bottom: .3em; border-bottom: 2px solid #111; }
+.chapter-head { break-before: page; }
+.chapter-title { font-size: 1.9rem; margin: 0 0 1em; padding-bottom: .3em; border-bottom: 2px solid #111; }
 .chapter-num { display: inline-block; min-width: 1.6em; color: #888; }
 .chapter-count { font-size: .85rem; color: #777; margin: -.8em 0 1.2em; }
 .note { margin: 0 0 1.4em; padding-bottom: 1em; border-bottom: 1px solid #ddd; }

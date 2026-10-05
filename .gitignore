@@ -2,3 +2,4 @@
 *.zip
 data.json
 export-log.txt
+test/*.pdf
