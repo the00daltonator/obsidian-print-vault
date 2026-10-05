@@ -544,7 +544,9 @@ window.__show = function (from, to) {
     const electron = require("electron");
     const remote = electron.remote || (() => { try { return require("@electron/remote"); } catch (_) { return null; } })();
     const { keyById, items, outline } = layout;
-    const pdfOpts = { printBackground: true, preferCSSPageSize: true, generateDocumentOutline: true };
+    // Chromium builds the bookmark outline from the tagged-PDF structure tree, so tagging must be on
+    // (Chrome enables it by default; Electron doesn't).
+    const pdfOpts = { printBackground: true, preferCSSPageSize: true, generateTaggedPDF: true, generateDocumentOutline: true };
 
     // Chunk plan over <main>'s children. Chunk -1 is the cover + contents.
     const MAX_NOTES = 100, MAX_BYTES = 12 * 1024 * 1024;
