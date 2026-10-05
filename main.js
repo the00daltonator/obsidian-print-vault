@@ -29,13 +29,6 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&
 const splitList = (s) => s.split(",").map((x) => x.trim()).filter(Boolean);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function toBase64(buf) {
-  const bytes = new Uint8Array(buf);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-  return btoa(bin);
-}
-
 module.exports = class PrintVaultPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -211,14 +204,16 @@ module.exports = class PrintVaultPlugin extends Plugin {
     el.querySelectorAll(".copy-code-button, .edit-block-button, .collapse-indicator, .heading-collapse-indicator, button, input:not([type=checkbox])").forEach((n) => n.remove());
     el.querySelectorAll("input[type=checkbox]").forEach((cb) => (cb.checked ? cb.setAttribute("checked", "") : cb.removeAttribute("checked")));
 
-    // Embeds: images → inline data URIs, notes → cross-reference.
+    // Embeds: images → shrunken temp copies, notes → cross-reference.
     for (const span of Array.from(el.querySelectorAll(".internal-embed"))) {
       const src = span.getAttribute("src") || "";
       const target = mc.getFirstLinkpathDest(getLinkpath(src), file.path);
       if (target && IMAGE_EXT.includes(target.extension.toLowerCase())) {
         if (!this.settings.includeImages) { span.replaceWith(this.mkNote(`[image: ${target.name}]`)); continue; }
+        const url = await this.printImage(this.app.vault.adapter.getFullPath(target.path), ctx);
+        if (!url) { span.replaceWith(this.mkNote(`[image: ${target.name}]`)); continue; }
         const img = document.createElement("img");
-        img.src = await this.dataUri(target, ctx);
+        img.src = url;
         img.alt = span.getAttribute("alt") || target.basename;
         const w = (span.getAttribute("width") || "").trim();
         if (/^\d+$/.test(w)) img.style.width = Math.min(+w, 1000) + "px";
@@ -236,19 +231,16 @@ module.exports = class PrintVaultPlugin extends Plugin {
       }
     }
 
-    // Remaining local images (markdown ![](x.png) syntax) → data URIs.
+    // Remaining local images (markdown ![](x.png) syntax, rendered as app:// URLs).
     for (const img of Array.from(el.querySelectorAll("img"))) {
       const src = img.getAttribute("src") || "";
-      if (src.startsWith("data:")) continue;
+      if (src.startsWith("data:") || src.startsWith("file:") || ctx.ownUrls.has(src)) continue;
       if (!this.settings.includeImages) { img.replaceWith(this.mkNote("[image]")); continue; }
       if (/^https?:/i.test(src)) continue;
-      try {
-        const res = await fetch(src);
-        const blob = await res.blob();
-        img.src = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
-      } catch (_) {
-        img.replaceWith(this.mkNote("[image unavailable]"));
-      }
+      let url = null;
+      try { url = await this.printImage(decodeURIComponent(new URL(src).pathname), ctx); } catch (_) {}
+      if (url) img.src = url;
+      else img.replaceWith(this.mkNote("[image unavailable]"));
     }
 
     // Internal links → in-document references (page numbers added via CSS).
@@ -282,12 +274,43 @@ module.exports = class PrintVaultPlugin extends Plugin {
     return s;
   }
 
-  async dataUri(file, ctx) {
-    if (ctx.imageCache.has(file.path)) return ctx.imageCache.get(file.path);
-    const buf = await this.app.vault.readBinary(file);
-    const uri = `data:${MIME[file.extension.toLowerCase()] || "application/octet-stream"};base64,${toBase64(buf)}`;
-    ctx.imageCache.set(file.path, uri);
-    return uri;
+  /**
+   * Shrinks an image to print resolution and writes it to the export's temp folder,
+   * returning a file:// URL. One image is in memory at a time, so huge photo
+   * libraries don't exhaust Obsidian's memory. Returns null if it can't be read.
+   */
+  async printImage(absPath, ctx) {
+    if (ctx.imageCache.has(absPath)) return ctx.imageCache.get(absPath);
+    const fs = require("fs"), path = require("path"), { pathToFileURL } = require("url");
+    const ext = path.extname(absPath).slice(1).toLowerCase();
+    let url = null;
+    try {
+      if (!fs.existsSync(absPath)) throw new Error("missing");
+      if (ext === "svg" || ext === "gif") {
+        url = pathToFileURL(absPath).href; // vector / animated: use as-is
+      } else {
+        const blob = new Blob([await fs.promises.readFile(absPath)], { type: MIME[ext] || "image/" + ext });
+        const bmp = await createImageBitmap(blob);
+        const maxPx = 1600;
+        const scale = Math.min(1, maxPx / Math.max(bmp.width, bmp.height));
+        const w = Math.max(1, Math.round(bmp.width * scale)), h = Math.max(1, Math.round(bmp.height * scale));
+        const canvas = new OffscreenCanvas(w, h);
+        const g = canvas.getContext("2d");
+        g.fillStyle = "#fff";
+        g.fillRect(0, 0, w, h);
+        g.drawImage(bmp, 0, 0, w, h);
+        bmp.close();
+        const out = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.82 });
+        const dest = path.join(ctx.tmpDir, `img${ctx.imageCache.size}.jpg`);
+        await fs.promises.writeFile(dest, Buffer.from(await out.arrayBuffer()));
+        url = pathToFileURL(dest).href;
+      }
+    } catch (e) {
+      console.warn("print-vault-pdf: skipped image", absPath, e && e.message);
+    }
+    ctx.imageCache.set(absPath, url);
+    if (url) ctx.ownUrls.add(url);
+    return url;
   }
 
   linkList(label, paths, ctx) {
@@ -299,10 +322,11 @@ module.exports = class PrintVaultPlugin extends Plugin {
     return `<div class="links-row"><span class="links-label">${label}</span>${items.join('<span class="sep"> · </span>')}</div>`;
   }
 
-  async buildHtml(groups, title, progress) {
+  /** Streams the printable HTML to htmlPath note by note (never holds the whole vault in memory). */
+  async writeHtml(groups, title, progress, htmlPath, tmpDir) {
     const s = this.settings;
     const grouped = groups.length > 1 || groups[0].name !== "";
-    const ctx = { idByPath: new Map(), numByPath: new Map(), titleByPath: new Map(), imageCache: new Map() };
+    const ctx = { idByPath: new Map(), numByPath: new Map(), titleByPath: new Map(), imageCache: new Map(), ownUrls: new Set(), tmpDir };
 
     // Numbering + anchors first, so links can be resolved while rendering.
     let n = 0;
@@ -342,12 +366,32 @@ module.exports = class PrintVaultPlugin extends Plugin {
     }
     toc.push("</section>");
 
-    // Body
+    const pagedJs = await this.app.vault.adapter.read(normalizePath(this.manifest.dir + "/paged.polyfill.min.js"));
+    const css = buildCss(s, grouped);
+    const date = new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
     const total = ctx.idByPath.size;
+
+    const fh = await require("fs").promises.open(htmlPath, "w");
+    const write = (str) => fh.write(str + "\n");
+    try {
+    await write(`<!doctype html>
+<html><head><meta charset="utf-8"><title>${esc(title)}</title>
+<style>${css}</style>
+<script>window.PagedConfig={auto:true,after:function(flow){window.__pagedDone=flow.total||document.querySelectorAll('.pagedjs_page').length;}};<\/script>
+<script>${pagedJs}<\/script>
+</head><body>
+<section class="cover">
+  <h1>${esc(title)}</h1>
+  <p class="cover-sub">${total} notes${grouped ? ` · ${groups.length} ${s.groupBy === "tag" ? "tag groups" : "folders"}` : ""}</p>
+  <p class="cover-date">Exported ${esc(date)}</p>
+</section>`);
+    await write(toc.join("\n"));
+    await write("<main>");
+
+    // Body
     let done = 0;
-    const body = [];
     for (const [gi, g] of groups.entries()) {
-      if (grouped) body.push(`<h1 class="chapter-title" id="${g.id}"><span class="chapter-num">${gi + 1}</span>${esc(g.name)}<span class="chapter-count">${g.files.length} note${g.files.length === 1 ? "" : "s"}</span></h1>`);
+      if (grouped) await write(`<h1 class="chapter-title" id="${g.id}"><span class="chapter-num">${gi + 1}</span>${esc(g.name)}<span class="chapter-count">${g.files.length} note${g.files.length === 1 ? "" : "s"}</span></h1>`);
       for (const f of g.files) {
         const id = ctx.idByPath.get(f.path);
         const html = await this.renderNote(f, ctx);
@@ -360,7 +404,7 @@ module.exports = class PrintVaultPlugin extends Plugin {
         const links = s.showLinks
           ? `<div class="links">${this.linkList("Links to", out.get(f.path) || [], ctx)}${this.linkList("Linked from", inc.get(f.path) || [], ctx)}</div>`
           : "";
-        body.push(
+        await write(
           `<article class="note${s.noteOnNewPage ? " new-page" : ""}" id="${id}">` +
             `<h2 class="note-title"><span class="note-num">${esc(ctx.numByPath.get(f.path))}</span>${esc(f.basename)}</h2>` +
             `<div class="note-meta">${meta.join("")}</div>` +
@@ -370,27 +414,13 @@ module.exports = class PrintVaultPlugin extends Plugin {
         );
         done++;
         if (done % 10 === 0 || done === total) progress(`Rendering notes… ${done}/${total}`);
+        await sleep(done % 20 === 0 ? 16 : 0); // let Obsidian repaint between notes
       }
     }
-
-    const pagedJs = await this.app.vault.adapter.read(normalizePath(this.manifest.dir + "/paged.polyfill.min.js"));
-    const css = buildCss(s, grouped);
-    const date = new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
-
-    return `<!doctype html>
-<html><head><meta charset="utf-8"><title>${esc(title)}</title>
-<style>${css}</style>
-<script>window.PagedConfig={auto:true,after:function(flow){window.__pagedDone=flow.total||document.querySelectorAll('.pagedjs_page').length;}};<\/script>
-<script>${pagedJs}<\/script>
-</head><body>
-<section class="cover">
-  <h1>${esc(title)}</h1>
-  <p class="cover-sub">${total} notes${grouped ? ` · ${groups.length} ${s.groupBy === "tag" ? "tag groups" : "folders"}` : ""}</p>
-  <p class="cover-date">Exported ${esc(date)}</p>
-</section>
-${toc.join("\n")}
-<main>${body.join("\n")}</main>
-</body></html>`;
+    await write("</main></body></html>");
+    } finally {
+      await fh.close();
+    }
   }
 
   // ---------- PDF ----------
@@ -400,7 +430,7 @@ ${toc.join("\n")}
     this.busy = true;
     const notice = new Notice("Print Vault: preparing…", 0);
     const progress = (msg) => notice.setMessage("Print Vault: " + msg);
-    let tmpHtml = null;
+    let tmpDir = null;
 
     try {
       const files = this.collectNotes(rootFolder);
@@ -409,11 +439,10 @@ ${toc.join("\n")}
       const scopeName = rootFolder && !rootFolder.isRoot() ? rootFolder.name : this.app.vault.getName();
       const title = this.settings.title.trim() || scopeName;
 
-      const html = await this.buildHtml(groups, title, progress);
-
       const os = require("os"), path = require("path"), fs = require("fs");
-      tmpHtml = path.join(os.tmpdir(), `print-vault-${Date.now()}.html`);
-      await fs.promises.writeFile(tmpHtml, html, "utf8");
+      tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "print-vault-"));
+      const tmpHtml = path.join(tmpDir, "export.html");
+      await this.writeHtml(groups, title, progress, tmpHtml, tmpDir);
 
       progress("Paginating (this can take a while for big vaults)…");
       const pdf = await this.printHtmlToPdf(tmpHtml, (pages) => progress(`Paginating… ${pages} pages so far`));
@@ -423,8 +452,9 @@ ${toc.join("\n")}
       if (folder !== "/" && !(await this.app.vault.adapter.exists(folder))) await this.app.vault.createFolder(folder);
       const base = `${scopeName.replace(/[\\/:*?"<>|]/g, "-")} - ${stamp}`;
       const outPath = normalizePath(`${folder === "/" ? "" : folder + "/"}${base}.pdf`);
-      await this.app.vault.adapter.writeBinary(outPath, pdf);
-      if (this.settings.keepHtml) await this.app.vault.adapter.write(normalizePath(outPath.replace(/\.pdf$/, ".html")), html);
+      const fullOut = this.app.vault.adapter.getFullPath(outPath);
+      await fs.promises.writeFile(fullOut, pdf);
+      if (this.settings.keepHtml) await fs.promises.copyFile(tmpHtml, fullOut.replace(/\.pdf$/, ".html"));
 
       notice.hide();
       new Notice(`Print Vault: saved ${outPath} (${files.length} notes).`, 8000);
@@ -437,7 +467,7 @@ ${toc.join("\n")}
       notice.hide();
       new Notice("Print Vault failed: " + (e && e.message ? e.message : e), 12000);
     } finally {
-      if (tmpHtml) require("fs").promises.unlink(tmpHtml).catch(() => {});
+      if (tmpDir) require("fs").promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       this.busy = false;
     }
   }
@@ -450,10 +480,15 @@ ${toc.join("\n")}
 
     const waitForPaged = async (exec) => {
       const deadline = Date.now() + 30 * 60 * 1000;
+      let failures = 0;
       while (Date.now() < deadline) {
         await sleep(700);
         const state = await exec("JSON.stringify({done: window.__pagedDone || 0, pages: document.querySelectorAll('.pagedjs_page').length})").catch(() => null);
-        if (!state) continue;
+        if (!state) {
+          if (++failures > 15) throw new Error("The export page stopped responding (it may have run out of memory). Try exporting one folder at a time, or turn off images.");
+          continue;
+        }
+        failures = 0;
         const { done, pages } = JSON.parse(state);
         if (done) return;
         if (pages) onPages(pages);
@@ -467,7 +502,7 @@ ${toc.join("\n")}
         await win.loadFile(htmlPath);
         await waitForPaged((js) => win.webContents.executeJavaScript(js));
         const data = await win.webContents.printToPDF(pdfOpts);
-        return new Uint8Array(data).buffer;
+        return Buffer.from(data);
       } finally {
         win.destroy();
       }
@@ -485,7 +520,7 @@ ${toc.join("\n")}
       });
       await waitForPaged((js) => wv.executeJavaScript(js));
       const data = await wv.printToPDF(pdfOpts);
-      return new Uint8Array(data).buffer;
+      return Buffer.from(data);
     } finally {
       wv.remove();
     }

@@ -20,7 +20,9 @@ const fakeObsidian = {
   } },
 };
 const module = { exports: {} };
-function require(n){ if (n === 'obsidian') return fakeObsidian; throw new Error('no ' + n); }
+const chunks = [];
+const fakeFs = { existsSync: () => false, promises: { open: async () => ({ write: async (t) => { chunks.push(t); }, close: async () => {} }) } };
+function require(n){ if (n === 'obsidian') return fakeObsidian; if (n === 'fs') return fakeFs; throw new Error('no ' + n); }
 </script>
 <script src="../main.js"></script>
 <script>
@@ -34,7 +36,7 @@ function require(n){ if (n === 'obsidian') return fakeObsidian; throw new Error(
     metadataCache: { getFileCache: f => ({ tags: f.tags }), resolvedLinks, getFirstLinkpathDest: (lp) => byName.get(lp) || null },
   };
   const groups = p.groupNotes(p.collectNotes());
-  const html = await p.buildHtml(groups, 'Main', m => console.log(m));
+  await p.writeHtml(groups, 'Main', m => console.log(m), '/tmp/x.html', '/tmp'); const html = chunks.join('');
   const fr = document.createElement("iframe"); fr.id = "out"; fr.style.cssText = "width:100%;height:95vh;border:0"; fr.srcdoc = html; document.body.appendChild(fr);
 })().catch(e => { document.body.textContent = 'ERROR: ' + e.stack; });
 </script></body></html>
