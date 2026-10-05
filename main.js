@@ -62,6 +62,14 @@ module.exports = class PrintVaultPlugin extends Plugin {
     this.addSettingTab(new PrintVaultSettingTab(this.app, this));
   }
 
+  /** Appends a timestamped line to export-log.txt in the plugin folder (for troubleshooting). */
+  log(msg) {
+    try {
+      const line = `${new Date().toISOString()}  ${msg}\n`;
+      require("fs").appendFileSync(this.app.vault.adapter.getFullPath(normalizePath(this.manifest.dir + "/export-log.txt")), line);
+    } catch (_) {}
+  }
+
   async saveSettings() {
     await this.saveData(this.settings);
   }
@@ -446,7 +454,16 @@ window.__fill = function (pages) {
     const notice = new Notice("Print Vault: preparing…", 0);
     const status = this.addStatusBarItem();
     status.setText("🖨️ Print Vault: preparing…");
-    const progress = (msg) => { notice.setMessage("Print Vault: " + msg); status.setText("🖨️ " + msg); };
+    let lastLogged = "";
+    const progress = (msg) => {
+      notice.setMessage("Print Vault: " + msg);
+      status.setText("🖨️ " + msg);
+      const kind = msg.replace(/[\d/]+/g, "#");
+      if (kind !== lastLogged || /(\d+)\/\1/.test(msg)) { this.log(msg); lastLogged = kind; }
+    };
+    let failed = false;
+    try { require("fs").writeFileSync(this.app.vault.adapter.getFullPath(normalizePath(this.manifest.dir + "/export-log.txt")), ""); } catch (_) {}
+    this.log(`Export started: Obsidian ${obsidian.apiVersion || "?"}, Electron ${process.versions.electron}, Chrome ${process.versions.chrome}, settings ${JSON.stringify(this.settings)}`);
     let tmpDir = null;
 
     try {
@@ -459,7 +476,9 @@ window.__fill = function (pages) {
       const os = require("os"), path = require("path"), fs = require("fs");
       tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "print-vault-"));
       const tmpHtml = path.join(tmpDir, "export.html");
+      this.log(`${files.length} notes in ${groups.length} groups; temp folder ${tmpDir}`);
       const keyById = await this.writeHtml(groups, title, progress, tmpHtml, tmpDir);
+      this.log(`HTML written: ${(fs.statSync(tmpHtml).size / 1048576).toFixed(1)} MB, ${fs.readdirSync(tmpDir).length - 1} images`);
 
       const pdf = await this.printHtmlToPdf(tmpHtml, keyById, progress);
 
@@ -470,6 +489,7 @@ window.__fill = function (pages) {
       const outPath = normalizePath(`${folder === "/" ? "" : folder + "/"}${base}.pdf`);
       const fullOut = this.app.vault.adapter.getFullPath(outPath);
       await fs.promises.writeFile(fullOut, pdf);
+      this.log(`Saved ${outPath} (${(pdf.length / 1048576).toFixed(1)} MB)`);
       if (this.settings.keepHtml) await fs.promises.copyFile(tmpHtml, fullOut.replace(/\.pdf$/, ".html"));
 
       notice.hide();
@@ -479,11 +499,15 @@ window.__fill = function (pages) {
         if (full) require("electron").shell.openPath(full);
       }
     } catch (e) {
+      failed = true;
       console.error("print-vault-pdf", e);
+      this.log("FAILED: " + (e && e.stack ? e.stack : e));
       notice.hide();
-      new Notice("Print Vault failed: " + (e && e.message ? e.message : e), 12000);
+      // Stays until clicked.
+      new Notice("Print Vault failed: " + (e && e.message ? e.message : e) + "\n\nDetails: .obsidian/plugins/print-vault-pdf/export-log.txt", 0);
     } finally {
-      if (tmpDir) require("fs").promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      // Keep temp files after a failure so the problem can be reproduced.
+      if (tmpDir && !failed) require("fs").promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       status.remove();
       this.busy = false;
     }
@@ -510,6 +534,7 @@ window.__fill = function (pages) {
     };
 
     let page;
+    this.log(`Printing with ${remote && remote.BrowserWindow ? "hidden window" : "webview"}`);
     if (remote && remote.BrowserWindow) {
       const win = new remote.BrowserWindow({ show: false, width: 1000, height: 1300, paintWhenInitiallyHidden: true, webPreferences: { javascript: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
       page = {
@@ -543,8 +568,10 @@ window.__fill = function (pages) {
       let pdf = null, prev = "";
       for (let pass = 1; pass <= 3; pass++) {
         progress(pass === 1 ? "Laying out pages…" : `Adding page numbers (pass ${pass})…`);
+        const t0 = Date.now();
         pdf = Buffer.from(await page.print());
         const byTitle = pdfHeadingPages(pdf);
+        this.log(`Pass ${pass}: ${(pdf.length / 1048576).toFixed(1)} MB in ${((Date.now() - t0) / 1000).toFixed(0)} s, ${byTitle ? byTitle.size : 0} bookmarks`);
         if (!byTitle) { console.warn("print-vault-pdf: no bookmarks found; using note numbers instead of page numbers"); break; }
         const pages = {};
         for (const [id, key] of Object.entries(keyById)) if (byTitle.has(key)) pages[id] = byTitle.get(key);

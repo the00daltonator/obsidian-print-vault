@@ -1,3 +1,4 @@
 .DS_Store
 *.zip
 data.json
+export-log.txt
