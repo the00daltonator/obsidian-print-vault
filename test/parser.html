@@ -1,0 +1,11 @@
+<!doctype html><meta charset="utf-8"><title>parser</title>
+<script>const module = { exports: {} }; function require(n){ if (n === 'obsidian') return { Plugin: class {}, PluginSettingTab: class {}, Component: class {} }; throw new Error(n); }</script>
+<script src="../main.js"></script>
+<script>
+(async () => {
+  const buf = await (await fetch('t.pdf')).arrayBuffer();
+  const t0 = performance.now();
+  const m = pdfHeadingPages(buf);
+  window.result = { ms: Math.round(performance.now() - t0), entries: m ? [...m.entries()] : null };
+})().catch(e => window.result = { err: String(e.stack) });
+</script>

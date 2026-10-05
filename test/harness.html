@@ -36,7 +36,7 @@ function require(n){ if (n === 'obsidian') return fakeObsidian; if (n === 'fs') 
     metadataCache: { getFileCache: f => ({ tags: f.tags }), resolvedLinks, getFirstLinkpathDest: (lp) => byName.get(lp) || null },
   };
   const groups = p.groupNotes(p.collectNotes());
-  await p.writeHtml(groups, 'Main', m => console.log(m), '/tmp/x.html', '/tmp'); const html = chunks.join('');
+  const keys = await p.writeHtml(groups, 'Main', m => console.log(m), '/tmp/x.html', '/tmp'); const html = chunks.join(''); window.keyById = keys; await fetch('/out.html', { method: 'PUT', body: html }); window.saved = true;
   const fr = document.createElement("iframe"); fr.id = "out"; fr.style.cssText = "width:100%;height:95vh;border:0"; fr.srcdoc = html; document.body.appendChild(fr);
 })().catch(e => { document.body.textContent = 'ERROR: ' + e.stack; });
 </script></body></html>

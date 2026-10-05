@@ -28,6 +28,8 @@ const MIME = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "im
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const splitList = (s) => s.split(",").map((x) => x.trim()).filter(Boolean);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Fixed-width slot for a page reference; filled in after the first print pass.
+const pgRef = (id, num) => `<span class="pg" data-t="${id}" data-n="${esc(num)}">(§${esc(num)})</span>`;
 
 module.exports = class PrintVaultPlugin extends Plugin {
   async onload() {
@@ -225,6 +227,7 @@ module.exports = class PrintVaultPlugin extends Plugin {
         a.textContent = "Embedded: " + target.basename;
         const p = document.createElement("p");
         p.appendChild(a);
+        p.insertAdjacentHTML("beforeend", " " + pgRef(idByPath.get(target.path), ctx.numByPath.get(target.path)));
         span.replaceWith(p);
       } else {
         span.replaceWith(this.mkNote(`[embedded: ${target ? target.name : src}]`));
@@ -250,6 +253,7 @@ module.exports = class PrintVaultPlugin extends Plugin {
       if (target && idByPath.has(target.path)) {
         a.setAttribute("href", "#" + idByPath.get(target.path));
         a.className = "xref";
+        a.insertAdjacentHTML("afterend", " " + pgRef(idByPath.get(target.path), ctx.numByPath.get(target.path)));
       } else {
         const span = document.createElement("span");
         span.className = "dead-link";
@@ -317,7 +321,7 @@ module.exports = class PrintVaultPlugin extends Plugin {
     const items = [...paths]
       .filter((p) => ctx.idByPath.has(p))
       .sort((a, b) => ctx.numByPath.get(a).localeCompare(ctx.numByPath.get(b), undefined, { numeric: true }))
-      .map((p) => `<a class="xref" href="#${ctx.idByPath.get(p)}">${esc(ctx.numByPath.get(p))} ${esc(ctx.titleByPath.get(p))}</a>`);
+      .map((p) => `<a class="xref" href="#${ctx.idByPath.get(p)}">${esc(ctx.numByPath.get(p))} ${esc(ctx.titleByPath.get(p))}</a> ${pgRef(ctx.idByPath.get(p), ctx.numByPath.get(p))}`);
     if (!items.length) return `<div class="links-row"><span class="links-label">${label}</span><span class="none">none</span></div>`;
     return `<div class="links-row"><span class="links-label">${label}</span>${items.join('<span class="sep"> · </span>')}</div>`;
   }
@@ -327,15 +331,18 @@ module.exports = class PrintVaultPlugin extends Plugin {
     const s = this.settings;
     const grouped = groups.length > 1 || groups[0].name !== "";
     const ctx = { idByPath: new Map(), numByPath: new Map(), titleByPath: new Map(), imageCache: new Map(), ownUrls: new Set(), tmpDir };
+    const keyById = {}; // anchor id → normalized heading text, to find its page in the PDF bookmarks
 
     // Numbering + anchors first, so links can be resolved while rendering.
     let n = 0;
     groups.forEach((g, gi) => {
       g.id = "g" + gi;
+      keyById[g.id] = normKey(`${gi + 1}${g.name}`);
       g.files.forEach((f, fi) => {
         ctx.idByPath.set(f.path, "n" + n++);
         ctx.numByPath.set(f.path, grouped ? `${gi + 1}.${fi + 1}` : `${fi + 1}`);
         ctx.titleByPath.set(f.path, f.basename);
+        keyById["n" + (n - 1)] = normKey(ctx.numByPath.get(f.path) + f.basename);
       });
     });
 
@@ -356,17 +363,16 @@ module.exports = class PrintVaultPlugin extends Plugin {
     const toc = [];
     toc.push('<section class="toc"><h1 class="toc-title">Contents</h1>');
     for (const [gi, g] of groups.entries()) {
-      if (grouped) toc.push(`<div class="toc-group"><a class="toc-entry toc-chapter" href="#${g.id}"><span class="toc-num">${gi + 1}</span><span class="toc-text">${esc(g.name)}</span></a>`);
+      if (grouped) toc.push(`<div class="toc-group"><a class="toc-entry toc-chapter" href="#${g.id}"><span class="toc-num">${gi + 1}</span><span class="toc-text">${esc(g.name)}</span><span class="pg toc-pg" data-t="${g.id}"></span></a>`);
       toc.push('<ol class="toc-list">');
       for (const f of g.files) {
-        toc.push(`<li><a class="toc-entry" href="#${ctx.idByPath.get(f.path)}"><span class="toc-num">${esc(ctx.numByPath.get(f.path))}</span><span class="toc-text">${esc(f.basename)}</span></a></li>`);
+        toc.push(`<li><a class="toc-entry" href="#${ctx.idByPath.get(f.path)}"><span class="toc-num">${esc(ctx.numByPath.get(f.path))}</span><span class="toc-text">${esc(f.basename)}</span><span class="pg toc-pg" data-t="${ctx.idByPath.get(f.path)}"></span></a></li>`);
       }
       toc.push("</ol>");
       if (grouped) toc.push("</div>");
     }
     toc.push("</section>");
 
-    const pagedJs = await this.app.vault.adapter.read(normalizePath(this.manifest.dir + "/paged.polyfill.min.js"));
     const css = buildCss(s, grouped);
     const date = new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
     const total = ctx.idByPath.size;
@@ -377,8 +383,15 @@ module.exports = class PrintVaultPlugin extends Plugin {
     await write(`<!doctype html>
 <html><head><meta charset="utf-8"><title>${esc(title)}</title>
 <style>${css}</style>
-<script>window.PagedConfig={auto:true,after:function(flow){window.__pagedDone=flow.total||document.querySelectorAll('.pagedjs_page').length;}};<\/script>
-<script>${pagedJs}<\/script>
+<script>
+window.__fill = function (pages) {
+  document.querySelectorAll(".pg").forEach(function (el) {
+    var p = pages[el.dataset.t], toc = el.classList.contains("toc-pg");
+    el.textContent = p ? (toc ? String(p) : "(p. " + p + ")") : (toc ? "" : "(§" + el.dataset.n + ")");
+  });
+  return true;
+};
+<\/script>
 </head><body>
 <section class="cover">
   <h1>${esc(title)}</h1>
@@ -391,7 +404,7 @@ module.exports = class PrintVaultPlugin extends Plugin {
     // Body
     let done = 0;
     for (const [gi, g] of groups.entries()) {
-      if (grouped) await write(`<h1 class="chapter-title" id="${g.id}"><span class="chapter-num">${gi + 1}</span>${esc(g.name)}<span class="chapter-count">${g.files.length} note${g.files.length === 1 ? "" : "s"}</span></h1>`);
+      if (grouped) await write(`<h1 class="chapter-title" id="${g.id}"><span class="chapter-num">${gi + 1}</span>${esc(g.name)}</h1><p class="chapter-count">${g.files.length} note${g.files.length === 1 ? "" : "s"}</p>`);
       for (const f of g.files) {
         const id = ctx.idByPath.get(f.path);
         const html = await this.renderNote(f, ctx);
@@ -421,6 +434,7 @@ module.exports = class PrintVaultPlugin extends Plugin {
     } finally {
       await fh.close();
     }
+    return keyById;
   }
 
   // ---------- PDF ----------
@@ -445,10 +459,9 @@ module.exports = class PrintVaultPlugin extends Plugin {
       const os = require("os"), path = require("path"), fs = require("fs");
       tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "print-vault-"));
       const tmpHtml = path.join(tmpDir, "export.html");
-      await this.writeHtml(groups, title, progress, tmpHtml, tmpDir);
+      const keyById = await this.writeHtml(groups, title, progress, tmpHtml, tmpDir);
 
-      progress("Paginating (this can take a while for big vaults)…");
-      const pdf = await this.printHtmlToPdf(tmpHtml, (pages) => progress(`Paginating… ${pages} pages so far`));
+      const pdf = await this.printHtmlToPdf(tmpHtml, keyById, progress);
 
       const stamp = new Date().toISOString().slice(0, 10);
       const folder = normalizePath(this.settings.outputFolder || "/");
@@ -476,71 +489,202 @@ module.exports = class PrintVaultPlugin extends Plugin {
     }
   }
 
-  /** Loads the HTML in a hidden Chromium page, waits for Paged.js, and prints to PDF. */
-  async printHtmlToPdf(htmlPath, onPages) {
+  /**
+   * Prints with Chromium's native engine (fast, even for thousands of pages).
+   * Pass 1 prints, reads which page every heading landed on from the PDF's
+   * bookmarks, writes those numbers into the TOC and link references, then
+   * prints again. Page-number slots are fixed width, so layout doesn't shift.
+   */
+  async printHtmlToPdf(htmlPath, keyById, progress) {
     const electron = require("electron");
     const remote = electron.remote || (() => { try { return require("@electron/remote"); } catch (_) { return null; } })();
-    const pdfOpts = { printBackground: true, preferCSSPageSize: true, generateDocumentOutline: true, margins: { marginType: "none" } };
-
-    const waitForPaged = async (exec) => {
-      const deadline = Date.now() + 30 * 60 * 1000;
-      let failures = 0;
-      while (Date.now() < deadline) {
-        await sleep(700);
-        const state = await exec("JSON.stringify({done: window.__pagedDone || 0, pages: document.querySelectorAll('.pagedjs_page').length})").catch(() => null);
-        if (!state) {
-          if (++failures > 15) throw new Error("The export page stopped responding (it may have run out of memory). Try exporting one folder at a time, or turn off images.");
-          continue;
-        }
-        failures = 0;
-        const { done, pages } = JSON.parse(state);
-        if (done) return;
-        if (pages) onPages(pages);
-      }
-      throw new Error("Timed out waiting for pagination.");
+    const s = this.settings;
+    const pdfOpts = {
+      printBackground: true,
+      preferCSSPageSize: true,
+      generateDocumentOutline: true,
+      displayHeaderFooter: true,
+      headerTemplate: "<span></span>",
+      footerTemplate: '<div style="width:100%;text-align:center;font:8px Georgia,serif;color:#555;"><span class="pageNumber"></span></div>',
+      pageSize: s.pageSize === "A4" ? "A4" : "Letter",
     };
 
+    let page;
     if (remote && remote.BrowserWindow) {
-      const win = new remote.BrowserWindow({ show: false, width: 1000, height: 1300, paintWhenInitiallyHidden: true, webPreferences: { offscreen: false, javascript: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
-      try {
-        await win.loadFile(htmlPath);
-        await waitForPaged((js) => win.webContents.executeJavaScript(js));
-        const data = await win.webContents.printToPDF(pdfOpts);
-        return Buffer.from(data);
-      } finally {
-        win.destroy();
-      }
+      const win = new remote.BrowserWindow({ show: false, width: 1000, height: 1300, paintWhenInitiallyHidden: true, webPreferences: { javascript: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
+      page = {
+        load: () => win.loadFile(htmlPath),
+        exec: (js) => win.webContents.executeJavaScript(js),
+        print: () => win.webContents.printToPDF(pdfOpts),
+        close: () => win.destroy(),
+      };
+    } else {
+      const wv = document.createElement("webview");
+      wv.setAttribute("style", "position:fixed;left:-20000px;top:0;width:1000px;height:1300px;");
+      document.body.appendChild(wv);
+      page = {
+        load: () => new Promise((res, rej) => {
+          wv.addEventListener("did-finish-load", res, { once: true });
+          wv.addEventListener("did-fail-load", (e) => rej(new Error("Could not load export page: " + e.errorDescription)), { once: true });
+          wv.setAttribute("src", require("url").pathToFileURL(htmlPath).href);
+        }),
+        exec: (js) => wv.executeJavaScript(js),
+        print: () => wv.printToPDF(pdfOpts),
+        close: () => wv.remove(),
+      };
     }
 
-    // Fallback: <webview> inside the Obsidian window.
-    const wv = document.createElement("webview");
-    wv.setAttribute("style", "position:fixed;left:-20000px;top:0;width:1000px;height:1300px;");
-    wv.setAttribute("src", "file://" + htmlPath);
-    document.body.appendChild(wv);
     try {
-      await new Promise((res, rej) => {
-        wv.addEventListener("dom-ready", res, { once: true });
-        wv.addEventListener("did-fail-load", (e) => rej(new Error("Could not load export page: " + e.errorDescription)), { once: true });
-      });
-      await waitForPaged((js) => wv.executeJavaScript(js));
-      const data = await wv.printToPDF(pdfOpts);
-      return Buffer.from(data);
+      progress("Loading pages for printing…");
+      await page.load();
+      await page.exec("document.fonts ? document.fonts.ready.then(() => true) : true");
+      await page.exec(`Promise.all([...document.images].map(i => i.complete ? 0 : new Promise(r => { i.onload = i.onerror = r; })))`);
+
+      let pdf = null, prev = "";
+      for (let pass = 1; pass <= 3; pass++) {
+        progress(pass === 1 ? "Laying out pages…" : `Adding page numbers (pass ${pass})…`);
+        pdf = Buffer.from(await page.print());
+        const byTitle = pdfHeadingPages(pdf);
+        if (!byTitle) { console.warn("print-vault-pdf: no bookmarks found; using note numbers instead of page numbers"); break; }
+        const pages = {};
+        for (const [id, key] of Object.entries(keyById)) if (byTitle.has(key)) pages[id] = byTitle.get(key);
+        const sig = JSON.stringify(pages);
+        if (sig === prev) break; // numbers already printed are correct
+        prev = sig;
+        await page.exec(`window.__fill(${sig})`);
+        if (pass === 3) pdf = Buffer.from(await page.print());
+      }
+      return pdf;
     } finally {
-      wv.remove();
+      page.close();
     }
   }
 };
 
+/**
+ * Reads the bookmarks Chromium writes for each heading (generateDocumentOutline)
+ * and returns Map(normalizedTitle → 1-based page number). Returns null if the
+ * PDF can't be parsed; callers then fall back to note numbers.
+ */
+function pdfHeadingPages(data) {
+  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const latin1 = (a, b) => {
+    let s = "";
+    for (let i = a; i < b; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(b, i + 0x8000)));
+    return s;
+  };
+  try {
+    const tail = latin1(Math.max(0, u8.length - 4096), u8.length);
+    let m, xrefOff = -1;
+    const sx = /startxref\s+(\d+)/g;
+    while ((m = sx.exec(tail))) xrefOff = +m[1];
+    if (xrefOff < 0) return null;
+    const xref = latin1(xrefOff, u8.length);
+    if (!xref.startsWith("xref")) return null;
+    const offsets = new Map();
+    const lines = xref.split(/\r\n|\r|\n/);
+    let i = 1;
+    while (i < lines.length && !lines[i].startsWith("trailer")) {
+      const sub = lines[i].trim().split(/\s+/);
+      if (sub.length === 2) {
+        const start = +sub[0], count = +sub[1];
+        for (let k = 0; k < count; k++) {
+          const e = (lines[i + 1 + k] || "").trim().split(/\s+/);
+          if (e[2] === "n") offsets.set(start + k, +e[0]);
+        }
+        i += count + 1;
+      } else i++;
+    }
+    const rootM = /\/Root\s+(\d+)\s+\d+\s+R/.exec(xref);
+    if (!rootM) return null;
+
+    const getObj = (n) => {
+      const off = offsets.get(n);
+      if (off == null) return "";
+      for (let win = 4096; win <= 1 << 20; win *= 4) {
+        const s = latin1(off, Math.min(u8.length, off + win));
+        const end = s.indexOf("endobj");
+        if (end >= 0) { const st = s.indexOf("stream"); return st >= 0 && st < end ? s.slice(0, st) : s.slice(0, end); }
+      }
+      return "";
+    };
+    const ref = (obj, key) => { const r = new RegExp("/" + key + "\\s+(\\d+)\\s+\\d+\\s+R").exec(obj); return r ? +r[1] : null; };
+
+    // Page object number → page index.
+    const pageNum = new Map();
+    const walk = (n, seen) => {
+      if (seen.has(n)) return;
+      seen.add(n);
+      const o = getObj(n);
+      const kids = /\/Kids\s*\[([^\]]*)\]/.exec(o);
+      if (/\/Type\s*\/Pages\b/.test(o) && kids) {
+        for (const k of kids[1].matchAll(/(\d+)\s+\d+\s+R/g)) walk(+k[1], seen);
+      } else pageNum.set(n, pageNum.size + 1);
+    };
+    const catalog = getObj(+rootM[1]);
+    walk(ref(catalog, "Pages"), new Set());
+
+    const decodeTitle = (o) => {
+      const at = o.search(/\/Title\s*[(<]/);
+      if (at < 0) return "";
+      let j = o.indexOf(o.slice(at).match(/[(<]/)[0], at);
+      const bytes = [];
+      if (o[j] === "<") {
+        const hex = o.slice(j + 1, o.indexOf(">", j)).replace(/\s+/g, "");
+        for (let h = 0; h + 1 < hex.length; h += 2) bytes.push(parseInt(hex.substr(h, 2), 16));
+      } else {
+        let depth = 0;
+        for (j++; j < o.length; j++) {
+          const c = o[j];
+          if (c === "\\") {
+            const nx = o[++j];
+            const esc = { n: 10, r: 13, t: 9, b: 8, f: 12 }[nx];
+            if (esc != null) bytes.push(esc);
+            else if (/[0-7]/.test(nx)) { let oct = nx; while (oct.length < 3 && /[0-7]/.test(o[j + 1])) oct += o[++j]; bytes.push(parseInt(oct, 8)); }
+            else if (nx === "\r" || nx === "\n") { /* line continuation */ }
+            else bytes.push(nx.charCodeAt(0));
+          } else if (c === "(") { depth++; bytes.push(40); }
+          else if (c === ")") { if (depth-- === 0) break; bytes.push(41); }
+          else bytes.push(c.charCodeAt(0));
+        }
+      }
+      const b = Uint8Array.from(bytes);
+      if (b[0] === 0xfe && b[1] === 0xff) return new TextDecoder("utf-16be").decode(b.subarray(2));
+      return String.fromCharCode.apply(null, b);
+    };
+
+    const result = new Map();
+    const first = ref(getObj(ref(catalog, "Outlines")), "First");
+    const stack = first != null ? [first] : [];
+    const seen = new Set();
+    while (stack.length) {
+      let n = stack.pop();
+      while (n != null && !seen.has(n)) {
+        seen.add(n);
+        const o = getObj(n);
+        const dest = /\/(?:Dest|D)\s*\[\s*(\d+)\s+\d+\s+R/.exec(o);
+        const key = normKey(decodeTitle(o));
+        if (dest && key && !result.has(key) && pageNum.has(+dest[1])) result.set(key, pageNum.get(+dest[1]));
+        const child = ref(o, "First");
+        if (child != null) stack.push(child);
+        n = ref(o, "Next");
+      }
+    }
+    return result.size ? result : null;
+  } catch (e) {
+    console.warn("print-vault-pdf: could not read PDF outline", e);
+    return null;
+  }
+}
+
+function normKey(s) {
+  return String(s).replace(/\s+/g, "").toLowerCase();
+}
+
 function buildCss(s, grouped) {
   const size = s.pageSize === "A4" ? "A4" : "Letter";
   return `
-@page { size: ${size}; margin: 0.75in 0.7in 0.8in 0.7in;
-  @top-left { content: string(chapter); font: 8pt/1 Georgia, serif; color: #777; }
-  @top-right { content: string(notetitle); font: 8pt/1 Georgia, serif; color: #777; }
-  @bottom-center { content: counter(page); font: 9pt/1 Georgia, serif; color: #555; }
-}
-@page :first { @top-left { content: none; } @top-right { content: none; } @bottom-center { content: none; } }
-@page toc { @top-left { content: "Contents"; } @top-right { content: none; } }
+@page { size: ${size}; margin: 0.7in 0.7in 0.8in 0.7in; }
 
 html { font-size: ${Number(s.fontSize) || 10.5}pt; }
 body { margin: 0; font-family: Georgia, "Iowan Old Style", "Times New Roman", serif; line-height: 1.45; color: #111; background: #fff; }
@@ -552,25 +696,24 @@ a { color: inherit; text-decoration: none; }
 .cover-sub, .cover-date { color: #555; margin: .2em 0; font-size: 1.1rem; }
 
 /* table of contents */
-.toc { page: toc; break-after: page; }
+.toc { break-after: page; }
 .toc-title { font-size: 1.8rem; margin: 0 0 1em; }
 .toc-group { margin-bottom: .6em; break-inside: auto; }
 .toc-list { list-style: none; margin: 0; padding: 0 0 0 ${grouped ? "1.6em" : "0"}; }
 .toc-list li { margin: 0; }
 .toc-entry { display: flex; align-items: baseline; gap: .5em; padding: .08em 0; }
 .toc-entry .toc-text { flex: 0 1 auto; overflow: hidden; }
-.toc-entry::after { content: target-counter(attr(href), page); flex: 0 0 auto; margin-left: auto; padding-left: .5em; font-variant-numeric: tabular-nums; }
-.toc-entry .toc-text::after { content: ""; }
+.toc-pg { flex: 0 0 auto; margin-left: auto; padding-left: .5em; min-width: 2.5em; text-align: right; font-variant-numeric: tabular-nums; }
 .toc-num { color: #666; min-width: 2.6em; font-variant-numeric: tabular-nums; }
 .toc-chapter { font-weight: bold; font-size: 1.05rem; margin-top: .5em; border-bottom: 1px solid #ccc; }
 
 /* chapters & notes */
-.chapter-title { break-before: page; string-set: chapter content(text); font-size: 1.9rem; margin: 0 0 1em; padding-bottom: .3em; border-bottom: 2px solid #111; }
+.chapter-title { break-before: page; font-size: 1.9rem; margin: 0 0 1em; padding-bottom: .3em; border-bottom: 2px solid #111; }
 .chapter-num { display: inline-block; min-width: 1.6em; color: #888; }
-.chapter-count { display: block; font-size: .8rem; font-weight: normal; color: #777; margin-top: .3em; }
+.chapter-count { font-size: .85rem; color: #777; margin: -.8em 0 1.2em; }
 .note { margin: 0 0 1.4em; padding-bottom: 1em; border-bottom: 1px solid #ddd; }
 .note.new-page { break-before: page; }
-.note-title { string-set: notetitle content(text); font-size: 1.35rem; margin: 0 0 .15em; break-after: avoid; }
+.note-title { font-size: 1.35rem; margin: 0 0 .15em; break-after: avoid; }
 .note-num { color: #888; font-weight: normal; margin-right: .5em; font-size: .9em; }
 .note-meta { font-size: .78rem; color: #777; margin-bottom: .5em; display: flex; gap: 1em; flex-wrap: wrap; }
 .links { font-size: .8rem; background: #f4f4f4; border-left: 3px solid #999; padding: .35em .6em; margin: .4em 0 .8em; break-inside: avoid; }
@@ -578,7 +721,7 @@ a { color: inherit; text-decoration: none; }
 .links-label { font-weight: bold; margin-right: .5em; }
 .links .none { color: #999; font-style: italic; }
 a.xref { border-bottom: 1px dotted #888; }
-a.xref::after { content: " (p. " target-counter(attr(href), page) ")"; color: #666; font-size: .85em; }
+.pg:not(.toc-pg) { display: inline-block; min-width: 4.6em; color: #666; font-size: .85em; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .dead-link { color: #555; font-style: italic; }
 .placeholder { color: #888; font-style: italic; font-size: .9em; }
 .render-error { color: #a00; }
