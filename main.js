@@ -428,8 +428,11 @@ module.exports = class PrintVaultPlugin extends Plugin {
   async exportPdf(rootFolder) {
     if (this.busy) { new Notice("Print Vault: an export is already running."); return; }
     this.busy = true;
+    // Progress shows in a notice and in the status bar (the notice can be clicked away).
     const notice = new Notice("Print Vault: preparing…", 0);
-    const progress = (msg) => notice.setMessage("Print Vault: " + msg);
+    const status = this.addStatusBarItem();
+    status.setText("🖨️ Print Vault: preparing…");
+    const progress = (msg) => { notice.setMessage("Print Vault: " + msg); status.setText("🖨️ " + msg); };
     let tmpDir = null;
 
     try {
@@ -468,6 +471,7 @@ module.exports = class PrintVaultPlugin extends Plugin {
       new Notice("Print Vault failed: " + (e && e.message ? e.message : e), 12000);
     } finally {
       if (tmpDir) require("fs").promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      status.remove();
       this.busy = false;
     }
   }
