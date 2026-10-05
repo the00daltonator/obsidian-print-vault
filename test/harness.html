@@ -1,0 +1,40 @@
+<!doctype html><html><head><meta charset="utf-8"><title>harness</title></head><body>
+<script>
+// Minimal fake Obsidian API, enough to drive buildHtml with sample notes.
+class FFolder { constructor(path){this.path=path;this.name=path.split('/').pop();} isRoot(){return this.path==='';} }
+class FFile { constructor(path,body,tags){this.path=path;this.basename=path.split('/').pop().replace(/\.md$/,'');this.extension='md';this.name=this.basename+'.md';const d=path.includes('/')?path.slice(0,path.lastIndexOf('/')):'';this.parent=new FFolder(d);this.stat={ctime:1,mtime:1};this.body=body;this.tags=tags;} }
+const lorem = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '.repeat(40);
+const notes = [];
+for (const [folder, n] of [['', 2], ['Learning', 6], ['Learning/Physics', 4], ['Goals', 5]])
+  for (let i = 1; i <= n; i++) notes.push(new FFile(`${folder ? folder + '/' : ''}${(folder.split('/').pop()||'Root')} note ${i}.md`, '', i % 2 ? ['school'] : ['ideas']));
+// each note links to the next two
+notes.forEach((f, i) => { f.links = [notes[(i+1)%notes.length], notes[(i+5)%notes.length]]; f.body = `## Heading\n${lorem}\n\nSee [[${f.links[0].basename}]] and [[${f.links[1].basename}]].\n\n- [ ] a task\n- [x] done task\n\n${lorem}`; });
+const byName = new Map(notes.map(f => [f.basename, f]));
+const resolvedLinks = {}; notes.forEach(f => { resolvedLinks[f.path] = {}; f.links.forEach(l => resolvedLinks[f.path][l.path] = 1); });
+const fakeObsidian = {
+  Plugin: class { constructor(){} }, PluginSettingTab: class {}, Setting: class {}, Notice: class { constructor(m){console.log('NOTICE',m);} setMessage(m){console.log('NOTICE',m);} hide(){} },
+  Component: class { load(){} unload(){} }, TFolder: FFolder, TFile: FFile,
+  normalizePath: p => p.replace(/^\/+|\/+$/g,''), getAllTags: c => c.tags.map(t=>'#'+t), getLinkpath: l => l.split('#')[0].split('|')[0],
+  MarkdownRenderer: { render: async (app, md, el) => {
+    el.innerHTML = md.split('\n\n').map(b => b.startsWith('## ') ? `<h2>${b.slice(3)}</h2>` : b.startsWith('- ') ? '<ul>' + b.split('\n').map(l => `<li class="task-list-item"><input type="checkbox" ${l.includes('[x]')?'checked':''}>${l.slice(6)}</li>`).join('') + '</ul>' : `<p>${b.replace(/\[\[([^\]]+)\]\]/g, '<a class="internal-link" data-href="$1" href="$1">$1</a>')}</p>`).join('');
+  } },
+};
+const module = { exports: {} };
+function require(n){ if (n === 'obsidian') return fakeObsidian; throw new Error('no ' + n); }
+</script>
+<script src="../main.js"></script>
+<script>
+(async () => {
+  const P = module.exports;
+  const p = new P();
+  p.manifest = { dir: '..' };
+  p.settings = { ...{groupBy:'folder', tagOrder:'', sortBy:'name', excludeFolders:'', excludeTags:'', pageSize:'Letter', fontSize:10.5, noteOnNewPage:false, showLinks:true, showTags:true, includeImages:true, outputFolder:'Exports'}, ...Object.fromEntries(new URLSearchParams(location.search)) };
+  p.app = {
+    vault: { getMarkdownFiles: () => notes, cachedRead: async f => f.body, getName: () => 'Main', adapter: { read: async path => (await fetch(path)).text() } },
+    metadataCache: { getFileCache: f => ({ tags: f.tags }), resolvedLinks, getFirstLinkpathDest: (lp) => byName.get(lp) || null },
+  };
+  const groups = p.groupNotes(p.collectNotes());
+  const html = await p.buildHtml(groups, 'Main', m => console.log(m));
+  const fr = document.createElement("iframe"); fr.id = "out"; fr.style.cssText = "width:100%;height:95vh;border:0"; fr.srcdoc = html; document.body.appendChild(fr);
+})().catch(e => { document.body.textContent = 'ERROR: ' + e.stack; });
+</script></body></html>

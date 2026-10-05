@@ -1,0 +1,9 @@
+{
+  "id": "print-vault-pdf",
+  "name": "Print Vault to PDF",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "One click: export every note into a single printable PDF with a table of contents, grouped by folder or tag, with incoming/outgoing link citations by page number.",
+  "author": "daltonh-s",
+  "isDesktopOnly": true
+}
